@@ -35,8 +35,6 @@ void Repository::init() {
     
     // 设置初始分支
     createInitialBranch();
-    
-    //std::cout << "Initialized gitlite directory." << std::endl;
 }
 
 void Repository::createDirectories() {
@@ -44,36 +42,51 @@ void Repository::createDirectories() {
     Utils::createDirectories(gitliteDir);
     Utils::createDirectories(Utils::join(gitliteDir, "objects"));
     Utils::createDirectories(Utils::join(gitliteDir, "refs"));
-    Utils::createDirectories(Utils::join(gitliteDir, "refs", "heads"));
-    Utils::createDirectories(Utils::join(gitliteDir, "refs", "remotes"));
+    
+    // 使用多次join创建嵌套目录
+    std::string refsHeads = Utils::join(Utils::join(gitliteDir, "refs"), "heads");
+    Utils::createDirectories(refsHeads);
+    
+    std::string refsRemotes = Utils::join(Utils::join(gitliteDir, "refs"), "remotes");
+    Utils::createDirectories(refsRemotes);
 }
 
 void Repository::createInitialCommit() {
-    // 创建初始提交
-    std::string commitContent = "initial commit\n0\n";
+    // 创建正确格式的初始提交（四行格式）
+    std::stringstream commitData;
+    commitData << "initial commit\n";          // 第1行：消息
+    commitData << "0\n";                       // 第2行：父提交（0表示没有）
+    commitData << "Thu Jan 01 00:00:00 1970 +0000\n";  // 第3行：时间戳
+    commitData << "0\n";                       // 第4行：blob数量（0个文件）
+    
+    std::string commitContent = commitData.str();
     std::string commitHash = Utils::sha1(commitContent);
     
-    // 保存提交
-    std::string commitPath = Utils::join(gitliteDir, "objects", commitHash);
+    // 保存提交 - 使用两次join
+    std::string objectsDir = Utils::join(gitliteDir, "objects");
+    std::string commitPath = Utils::join(objectsDir, commitHash);
     Utils::writeContents(commitPath, commitContent);
     
-    // 保存提交引用
+    // 保存HEAD文件
     std::string headPath = Utils::join(gitliteDir, "HEAD");
     Utils::writeContents(headPath, "ref: refs/heads/master\n");
 }
 
 void Repository::createInitialBranch() {
-    // 创建master分支
-    std::string commitContent = "initial commit\n0\n";
+    // 创建正确格式的初始提交（四行格式）
+    std::stringstream commitData;
+    commitData << "initial commit\n";          // 第1行：消息
+    commitData << "0\n";                       // 第2行：父提交（0表示没有）
+    commitData << "Thu Jan 01 00:00:00 1970 +0000\n";  // 第3行：时间戳
+    commitData << "0\n";                       // 第4行：blob数量（0个文件）
+    
+    std::string commitContent = commitData.str();
     std::string commitHash = Utils::sha1(commitContent);
     
-    // 修复join调用 - 使用链式方式
+    // 创建master分支引用 - 使用多次join
     std::string refsDir = Utils::join(gitliteDir, "refs");
     std::string headsDir = Utils::join(refsDir, "heads");
     std::string masterPath = Utils::join(headsDir, "master");
     
     Utils::writeContents(masterPath, commitHash + "\n");
-    
-    // 同时需要确保目录存在
-    Utils::createDirectories(Utils::join(refsDir, "heads"));
 }
