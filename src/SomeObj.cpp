@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <ctime>
 #include <iomanip>
+#include <queue>
+#include <functional>
 
 namespace fs = std::filesystem;
 
@@ -38,13 +40,24 @@ private:
     std::string getCommitMessage(const std::string& commitHash) const;
     void printCommitInfo(const std::string& commitHash, bool includeMergeInfo = true) const;
     std::pair<std::string, std::string> getCommitParents(const std::string& commitHash) const;
+
+    std::string findSplitPoint(const std::string& commit1, const std::string& commit2) const;
+    void checkUntrackedFilesForMerge(const std::string& currentCommit, 
+                                     const std::string& givenCommit,
+                                     const std::string& splitPoint) const;
+    std::set<std::string> performMerge(const std::string& currentCommit,
+                                       const std::string& givenCommit,
+                                       const std::string& splitPoint,
+                                       const std::string& branchName);
+    std::map<std::string, std::string> getCommitFiles(const std::string& commitHash) const;
+    bool filesEqual(const std::string& file1, const std::string& file2) const;
     
 public:
     Impl();
     
     void init();
     void add(const std::string& filename);
-    void commit(const std::string& message);
+    void commit(const std::string& message, const std::string& secondParent = "");
     void rm(const std::string& filename);
     void status();
     void log();
@@ -56,9 +69,9 @@ public:
     void branch(const std::string&);
     void rmBranch(const std::string&);
     void reset(const std::string&);
+    void merge(const std::string&);
 
     // 其他方法保持空实现
-    void merge(const std::string&) {}
     void addRemote(const std::string&, const std::string&) {}
     void rmRemote(const std::string&) {}
     void push(const std::string&, const std::string&) {}
@@ -231,77 +244,102 @@ void SomeObj::Impl::add(const std::string& filename) {
     saveStaging();
 }
 
-void SomeObj::Impl::commit(const std::string& message) {
+void SomeObj::Impl::commit(const std::string& message, const std::string& secondParent) {
     if (message.empty()) {
         Utils::exitWithMessage("Please enter a commit message.");
     }
-
-    if (stagedFiles.empty() && removedFiles.empty()) {
+    
+    // 检查是否有文件被暂存（合并提交时可能有例外）
+    if (stagedFiles.empty() && removedFiles.empty() && secondParent.empty()) {
         Utils::exitWithMessage("No changes added to the commit.");
     }
-
+    
     std::string parentHash = getHeadCommitHash();
+    
     std::stringstream commitData;
     commitData << message << "\n";
-    commitData << (parentHash.empty() ? "0" : parentHash) << "\n";
-
+    
+    // 写入父提交（合并提交有两个父提交）
+    if (parentHash.empty() || !Utils::exists(objectsDir + "/" + parentHash)) {
+        commitData << "0\n";
+    } else {
+        commitData << parentHash << "\n";
+    }
+    
+    // 如果是合并提交，添加第二个父提交
+    if (!secondParent.empty()) {
+        commitData << secondParent << "\n";
+    }
+    
+    // 时间戳
     std::time_t now = std::time(nullptr);
+    std::tm* gmt = std::gmtime(&now);
     char timeBuffer[100];
-    std::strftime(timeBuffer, sizeof(timeBuffer), "%a %b %d %H:%M:%S %Y +0000", std::gmtime(&now));
+    std::strftime(timeBuffer, sizeof(timeBuffer), "%a %b %d %H:%M:%S %Y +0000", gmt);
     commitData << timeBuffer << "\n";
-
+    
+    // 收集blob信息
     std::map<std::string, std::string> blobs;
-
-    // 继承父提交 blobs
+    
+    // 从第一个父提交继承blob（如果存在且不是初始提交）
     if (!parentHash.empty() && parentHash != "0") {
-        std::string parentPath = objectsDir + "/" + parentHash;
-        if (Utils::exists(parentPath)) {
-            std::string parentContent = Utils::readContentsAsString(parentPath);
-            std::stringstream ss(parentContent);
+        std::string commitPath = objectsDir + "/" + parentHash;
+        if (Utils::exists(commitPath)) {
+            std::string commitContent = Utils::readContentsAsString(commitPath);
+            std::stringstream ss(commitContent);
+            
+            // 跳过消息行
             std::string line;
-            std::getline(ss, line); // message
-            std::getline(ss, line); // parent
-            std::getline(ss, line); // timestamp
-
-            int blobCount = 0;
-            if (ss >> blobCount) {
-                ss.ignore(); // 跳过换行
-                for (int i = 0; i < blobCount; ++i) {
-                    if (!std::getline(ss, line)) break;
-                    std::istringstream iss(line);
-                    std::string blobHash, blobFile;
-                    if (!(iss >> blobHash >> blobFile)) continue;
-                    blobs[blobFile] = blobHash;
-                }
+            std::getline(ss, line);  // 消息
+            
+            // 跳过父提交行（可能有两行）
+            std::getline(ss, line);  // 第一个父提交
+            // 检查是否有第二个父提交
+            std::getline(ss, line);
+            if (line.find(":") == std::string::npos) {
+                // 这是第二个父提交，跳过时间戳行
+                std::getline(ss, line);
+            }
+            // 现在line是时间戳
+            
+            int blobCount;
+            ss >> blobCount;
+            
+            for (int i = 0; i < blobCount; ++i) {
+                std::string blobHash, blobFile;
+                ss >> blobHash >> blobFile;
+                blobs[blobFile] = blobHash;
             }
         }
     }
-
-    // 添加暂存区文件
+    
+    // 添加暂存的文件
     for (const auto& [filename, hash] : stagedFiles) {
         blobs[filename] = hash;
     }
-
-    // 移除 deleted 文件
-    for (const auto& file : removedFiles) {
-        blobs.erase(file);
+    
+    // 移除标记为删除的文件
+    for (const auto& filename : removedFiles) {
+        blobs.erase(filename);
     }
-
-    // 写入 blobs 数量
+    
+    // 写入blob数量和信息
     commitData << blobs.size() << "\n";
     for (const auto& [filename, hash] : blobs) {
         commitData << hash << " " << filename << "\n";
     }
-
+    
+    // 保存提交
     std::string commitContent = commitData.str();
     std::string commitHash = Utils::sha1(commitContent);
     std::string commitPath = objectsDir + "/" + commitHash;
     Utils::writeContents(commitPath, commitContent);
-
-    // 更新分支
+    
+    // 更新分支引用
     std::string branchPath = gitliteDir + "/refs/heads/" + currentBranch;
     Utils::writeContents(branchPath, commitHash + "\n");
-
+    
+    // 清空暂存区
     stagedFiles.clear();
     removedFiles.clear();
     saveStaging();
@@ -357,28 +395,9 @@ void SomeObj::Impl::rm(const std::string& filename) {
 // ==================== Subtask2 辅助方法 ====================
 
 std::string SomeObj::Impl::formatTimestamp(const std::string& utcTimestamp) const {
-    // 初始提交的特殊处理
-    if (utcTimestamp == "Thu Jan 01 00:00:00 1970 +0000") {
-        return "Wed Jan 01 08:00:00 1970 +0800";
-    }
-    
-    // 尝试解析UTC时间
-    std::tm tm = {};
-    std::stringstream ss(utcTimestamp);
-    ss >> std::get_time(&tm, "%a %b %d %H:%M:%S %Y %z");
-    
-    if (ss.fail()) {
-        return utcTimestamp;
-    }
-    
-    // 转换为本地时间
-    std::time_t utcTime = std::mktime(&tm);
-    std::tm* localTm = std::localtime(&utcTime);
-    
-    char buffer[100];
-    std::strftime(buffer, sizeof(buffer), "%a %b %d %H:%M:%S %Y %z", localTm);
-    
-    return std::string(buffer);
+    // 直接返回UTC时间戳，不进行转换
+    // 初始提交的时间戳已经是UTC时间
+    return utcTimestamp;
 }
 
 std::vector<std::string> SomeObj::Impl::getAllCommitHashes() const {
@@ -852,6 +871,639 @@ void SomeObj::Impl::reset(const std::string& commitId) {
     saveStaging();
 }
 
+// ==================== Subtask5 辅助方法 ====================
+// 寻找两个提交的最低公共祖先
+std::string SomeObj::Impl::findSplitPoint(const std::string& commit1, const std::string& commit2) const {
+    // 使用深度优先搜索找到所有祖先
+    std::function<void(const std::string&, std::set<std::string>&, int)> collectAncestors = 
+        [&](const std::string& commit, std::set<std::string>& ancestors, int depth) {
+            if (commit.empty() || commit == "0" || depth > 100) return;
+            
+            ancestors.insert(commit);
+            
+            std::string commitPath = objectsDir + "/" + commit;
+            if (!Utils::exists(commitPath)) return;
+            
+            std::string content = Utils::readContentsAsString(commitPath);
+            std::stringstream ss(content);
+            
+            // 跳过消息
+            std::string line;
+            std::getline(ss, line);
+            
+            // 读取父提交
+            std::getline(ss, line);
+            std::string parent1 = line;
+            
+            // 检查是否有第二个父提交
+            std::string parent2 = "";
+            std::getline(ss, line);
+            if (line.find(":") == std::string::npos) {
+                parent2 = line;
+            }
+            
+            // 递归处理父提交
+            if (!parent1.empty() && parent1 != "0") {
+                collectAncestors(parent1, ancestors, depth + 1);
+            }
+            if (!parent2.empty() && parent2 != "0") {
+                collectAncestors(parent2, ancestors, depth + 1);
+            }
+        };
+    
+    // 收集commit1的所有祖先
+    std::set<std::string> ancestors1;
+    collectAncestors(commit1, ancestors1, 0);
+    
+    // 使用BFS从commit2开始寻找第一个在ancestors1中的提交
+    std::queue<std::string> queue;
+    std::set<std::string> visited;
+    
+    queue.push(commit2);
+    visited.insert(commit2);
+    
+    while (!queue.empty()) {
+        std::string current = queue.front();
+        queue.pop();
+        
+        if (ancestors1.find(current) != ancestors1.end()) {
+            return current;
+        }
+        
+        if (current.empty() || current == "0") continue;
+        
+        std::string commitPath = objectsDir + "/" + current;
+        if (!Utils::exists(commitPath)) continue;
+        
+        std::string content = Utils::readContentsAsString(commitPath);
+        std::stringstream ss(content);
+        
+        // 跳过消息
+        std::string line;
+        std::getline(ss, line);
+        
+        // 读取父提交
+        std::getline(ss, line);
+        std::string parent1 = line;
+        
+        // 检查是否有第二个父提交
+        std::string parent2 = "";
+        std::getline(ss, line);
+        if (line.find(":") == std::string::npos) {
+            parent2 = line;
+        }
+        
+        // 添加父提交到队列
+        if (!parent1.empty() && parent1 != "0" && visited.find(parent1) == visited.end()) {
+            queue.push(parent1);
+            visited.insert(parent1);
+        }
+        if (!parent2.empty() && parent2 != "0" && visited.find(parent2) == visited.end()) {
+            queue.push(parent2);
+            visited.insert(parent2);
+        }
+    }
+    
+    return "0"; // 返回初始提交
+}
+
+// 获取提交中的所有文件
+std::map<std::string, std::string> SomeObj::Impl::getCommitFiles(const std::string& commitHash) const {
+    std::map<std::string, std::string> files;
+    
+    if (commitHash.empty() || commitHash == "0") {
+        return files;
+    }
+    
+    std::string commitPath = objectsDir + "/" + commitHash;
+    if (!Utils::exists(commitPath)) {
+        return files;
+    }
+    
+    std::string content = Utils::readContentsAsString(commitPath);
+    std::stringstream ss(content);
+    
+    // 跳过消息
+    std::string line;
+    std::getline(ss, line);
+    
+    // 跳过父提交（可能有1个或2个）
+    std::getline(ss, line); // 第一个父提交
+    std::getline(ss, line); // 可能是第二个父提交或时间戳
+    
+    // 如果是第二个父提交，再读一行获取时间戳
+    if (line.find(":") == std::string::npos) {
+        std::getline(ss, line); // 时间戳
+    }
+    // 现在line是时间戳
+    
+    int blobCount;
+    ss >> blobCount;
+    
+    for (int i = 0; i < blobCount; ++i) {
+        std::string blobHash, filename;
+        ss >> blobHash >> filename;
+        files[filename] = blobHash;
+    }
+    
+    return files;
+}
+
+// 检查两个文件是否相等
+bool SomeObj::Impl::filesEqual(const std::string& file1, const std::string& file2) const {
+    return file1 == file2;
+}
+
+// 检查未跟踪文件冲突
+void SomeObj::Impl::checkUntrackedFilesForMerge(const std::string& currentCommit,
+                                               const std::string& givenCommit,
+                                               const std::string& splitPoint) const {
+    auto splitFiles = getCommitFiles(splitPoint);
+    auto currentFiles = getCommitFiles(currentCommit);
+    auto givenFiles = getCommitFiles(givenCommit);
+    
+    // 检查所有在给定分支中存在但在分割点或当前分支中不存在的文件
+    for (const auto& [filename, hash] : givenFiles) {
+        bool inSplit = (splitFiles.find(filename) != splitFiles.end());
+        bool inCurrent = (currentFiles.find(filename) != currentFiles.end());
+        
+        // 如果文件在给定分支中但不在分割点或当前分支中，并且工作目录中存在
+        if ((!inSplit || !inCurrent) && Utils::exists(filename)) {
+            // 检查是否未被跟踪（不在暂存区）
+            if (stagedFiles.find(filename) == stagedFiles.end()) {
+                Utils::exitWithMessage("There is an untracked file in the way; delete it, or add and commit it first.");
+            }
+        }
+    }
+}
+
+// 执行合并操作
+std::set<std::string> SomeObj::Impl::performMerge(const std::string& currentCommit,
+                                                  const std::string& givenCommit,
+                                                  const std::string& splitPoint,
+                                                  const std::string& branchName) {
+    std::set<std::string> conflictFiles;
+    
+    auto splitFiles = getCommitFiles(splitPoint);
+    auto currentFiles = getCommitFiles(currentCommit);
+    auto givenFiles = getCommitFiles(givenCommit);
+    
+    // 收集所有涉及的文件名
+    std::set<std::string> allFiles;
+    for (const auto& [filename, hash] : splitFiles) allFiles.insert(filename);
+    for (const auto& [filename, hash] : currentFiles) allFiles.insert(filename);
+    for (const auto& [filename, hash] : givenFiles) allFiles.insert(filename);
+    
+    // 遍历所有文件
+    for (const auto& filename : allFiles) {
+        bool inSplit = (splitFiles.find(filename) != splitFiles.end());
+        bool inCurrent = (currentFiles.find(filename) != currentFiles.end());
+        bool inGiven = (givenFiles.find(filename) != givenFiles.end());
+        
+        std::string splitHash = inSplit ? splitFiles[filename] : "";
+        std::string currentHash = inCurrent ? currentFiles[filename] : "";
+        std::string givenHash = inGiven ? givenFiles[filename] : "";
+        
+        // 情况1: 在给定分支中被修改，在当前分支中未修改
+        if (inSplit && inCurrent && inGiven) {
+            if (currentHash == splitHash && givenHash != splitHash) {
+                // 从给定分支恢复文件
+                restoreFileFromCommit(givenCommit, filename);
+                add(filename); // 自动暂存
+                continue;
+            }
+        }
+        
+        // 情况2: 在当前分支中被修改，在给定分支中未修改
+        if (inSplit && inCurrent && inGiven) {
+            if (givenHash == splitHash && currentHash != splitHash) {
+                // 保持当前版本不变
+                continue;
+            }
+        }
+        
+        // 情况3: 在两个分支中以相同方式修改
+        if (inSplit && inCurrent && inGiven) {
+            if (currentHash == givenHash) {
+                // 文件保持不变
+                continue;
+            }
+        }
+        
+        // 情况4: 仅在给定分支中存在（分割点不存在）
+        if (!inSplit && !inCurrent && inGiven) {
+            // 从给定分支恢复文件并暂存
+            restoreFileFromCommit(givenCommit, filename);
+            add(filename);
+            continue;
+        }
+        
+        // 情况5: 仅在当前分支中存在（分割点不存在）
+        if (!inSplit && inCurrent && !inGiven) {
+            // 保持原样
+            continue;
+        }
+        
+        // 情况6: 在分割点存在，在当前分支中未修改，在给定分支中被删除
+        if (inSplit && inCurrent && !inGiven) {
+            if (currentHash == splitHash) {
+                // 删除文件
+                if (Utils::exists(filename)) {
+                    Utils::restrictedDelete(filename);
+                }
+                // 不跟踪该文件
+                continue;
+            }
+        }
+        
+        // 情况7: 在分割点存在，在给定分支中未修改，在当前分支中被删除
+        if (inSplit && !inCurrent && inGiven) {
+            if (givenHash == splitHash) {
+                // 保持不被跟踪和暂存
+                continue;
+            }
+        }
+        
+        // 情况8: 冲突 - 在两个分支中以不同方式修改
+        bool isConflict = false;
+        
+        if (inSplit) {
+            // 文件在分割点存在
+            if (inCurrent && inGiven) {
+                // 在两个分支中都存在但修改不同
+                if (currentHash != givenHash && currentHash != splitHash && givenHash != splitHash) {
+                    isConflict = true;
+                }
+            } else if (inCurrent && !inGiven) {
+                // 在当前分支中修改或删除，在给定分支中删除
+                if (currentHash != splitHash) {
+                    isConflict = true;
+                }
+            } else if (!inCurrent && inGiven) {
+                // 在当前分支中删除，在给定分支中修改或删除
+                if (givenHash != splitHash) {
+                    isConflict = true;
+                }
+            }
+        } else {
+            // 文件在分割点不存在
+            if (inCurrent && inGiven) {
+                // 在两个分支中都存在但内容不同
+                if (currentHash != givenHash) {
+                    isConflict = true;
+                }
+            }
+        }
+        
+        if (isConflict) {
+            conflictFiles.insert(filename);
+            // 解决冲突
+            std::string currentContent = "";
+            std::string givenContent = "";
+            
+            if (inCurrent) {
+                std::string blobPath = objectsDir + "/" + currentHash;
+                if (Utils::exists(blobPath)) {
+                    currentContent = Utils::readContentsAsString(blobPath);
+                }
+            }
+            
+            if (inGiven) {
+                std::string blobPath = objectsDir + "/" + givenHash;
+                if (Utils::exists(blobPath)) {
+                    givenContent = Utils::readContentsAsString(blobPath);
+                }
+            }
+            
+            // 创建冲突标记
+            std::string conflictContent = "<<<<<<< HEAD\n";
+            conflictContent += currentContent;
+            conflictContent += "=======\n";
+            conflictContent += givenContent;
+            conflictContent += ">>>>>>>\n";
+            
+            Utils::writeContents(filename, conflictContent);
+            add(filename); // 自动暂存冲突文件
+        }
+    }
+    
+    return conflictFiles;
+}
+
+// ==================== Subtask5 方法 ====================
+void SomeObj::Impl::merge(const std::string& branchName) {
+    // 1. 检查是否有未提交的更改
+    if (!stagedFiles.empty() || !removedFiles.empty()) {
+        Utils::exitWithMessage("You have uncommitted changes.");
+    }
+    
+    // 2. 检查分支是否存在
+    std::string givenBranchPath = gitliteDir + "/refs/heads/" + branchName;
+    if (!Utils::exists(givenBranchPath)) {
+        Utils::exitWithMessage("A branch with that name does not exist.");
+    }
+    
+    // 3. 检查是否合并自身
+    if (branchName == currentBranch) {
+        Utils::exitWithMessage("Cannot merge a branch with itself.");
+    }
+    
+    // 4. 获取当前分支和给定分支的提交哈希
+    std::string currentCommitHash = getHeadCommitHash();
+    std::string givenCommitHash = Utils::readContentsAsString(givenBranchPath);
+    if (!givenCommitHash.empty() && givenCommitHash.back() == '\n') {
+        givenCommitHash.pop_back();
+    }
+    
+    // 5. 寻找分割点
+    std::string splitPoint = findSplitPoint(currentCommitHash, givenCommitHash);
+    
+    // 6. 检查特殊情况
+    if (splitPoint == givenCommitHash) {
+        std::cout << "Given branch is an ancestor of the current branch." << std::endl;
+        return;
+    }
+    
+    if (splitPoint == currentCommitHash) {
+        checkoutBranch(branchName);
+        std::cout << "Current branch fast-forwarded." << std::endl;
+        return;
+    }
+    
+    // 7. 获取三个提交的文件状态
+    auto splitFiles = getCommitFiles(splitPoint);
+    auto currentFiles = getCommitFiles(currentCommitHash);
+    auto givenFiles = getCommitFiles(givenCommitHash);
+    
+    // 8. 检查未跟踪文件冲突
+    for (const auto& [filename, hash] : givenFiles) {
+        bool inCurrent = (currentFiles.find(filename) != currentFiles.end());
+        bool inSplit = (splitFiles.find(filename) != splitFiles.end());
+        
+        // 如果文件在给定分支中但不在当前提交或分割点中
+        if (!inCurrent || !inSplit) {
+            // 检查工作目录中是否有未跟踪的同名文件
+            if (Utils::exists(filename)) {
+                // 检查是否未被跟踪（不在暂存区）且不被当前提交跟踪
+                if (stagedFiles.find(filename) == stagedFiles.end() && 
+                    currentFiles.find(filename) == currentFiles.end()) {
+                    Utils::exitWithMessage("There is an untracked file in the way; delete it, or add and commit it first.");
+                }
+            }
+        }
+    }
+    
+    // 9. 执行合并，跟踪修改和冲突
+    bool hasConflict = false;
+    std::set<std::string> allModifiedFiles;
+    
+    // 收集所有涉及的文件
+    std::set<std::string> allFiles;
+    for (const auto& [f, h] : splitFiles) allFiles.insert(f);
+    for (const auto& [f, h] : currentFiles) allFiles.insert(f);
+    for (const auto& [f, h] : givenFiles) allFiles.insert(f);
+    
+    // 清空当前暂存区（合并会创建新的暂存状态）
+    std::map<std::string, std::string> newStagedFiles;
+    std::set<std::string> newRemovedFiles;
+    
+    for (const auto& filename : allFiles) {
+        bool inSplit = (splitFiles.find(filename) != splitFiles.end());
+        bool inCurrent = (currentFiles.find(filename) != currentFiles.end());
+        bool inGiven = (givenFiles.find(filename) != givenFiles.end());
+        
+        std::string splitHash = inSplit ? splitFiles[filename] : "";
+        std::string currentHash = inCurrent ? currentFiles[filename] : "";
+        std::string givenHash = inGiven ? givenFiles[filename] : "";
+        
+        // 情况1: 在给定分支中被修改，在当前分支中未修改
+        if (inSplit && inCurrent && inGiven) {
+            if (currentHash == splitHash && givenHash != splitHash) {
+                // 从给定分支恢复文件
+                restoreFileFromCommit(givenCommitHash, filename);
+                newStagedFiles[filename] = givenHash;
+                allModifiedFiles.insert(filename);
+                continue;
+            }
+        }
+        
+        // 情况2: 仅在给定分支中存在（分割点不存在）
+        if (!inSplit && !inCurrent && inGiven) {
+            // 恢复给定分支的版本
+            restoreFileFromCommit(givenCommitHash, filename);
+            newStagedFiles[filename] = givenHash;
+            allModifiedFiles.insert(filename);
+            continue;
+        }
+        
+        // 情况3: 在分割点存在，在当前分支中未修改，在给定分支中被删除
+        if (inSplit && inCurrent && !inGiven) {
+            if (currentHash == splitHash) {
+                // 删除文件
+                if (Utils::exists(filename)) {
+                    Utils::restrictedDelete(filename);
+                }
+                newRemovedFiles.insert(filename);
+                allModifiedFiles.insert(filename);
+                continue;
+            }
+        }
+        
+        // 情况4: 在当前分支中被修改，在给定分支中未修改 - 保持原样
+        if (inSplit && inCurrent && inGiven) {
+            if (givenHash == splitHash && currentHash != splitHash) {
+                // 保持当前版本，不需要暂存
+                continue;
+            }
+        }
+        
+        // 情况5: 在两个分支中以相同方式修改 - 保持不变
+        if (inSplit && inCurrent && inGiven) {
+            if (currentHash == givenHash) {
+                // 文件保持不变
+                continue;
+            }
+        }
+        
+        // 情况6: 冲突检测
+        bool isConflict = false;
+        
+        if (inSplit) {
+            if (inCurrent && inGiven) {
+                // 在两个分支中都修改了，但方式不同
+                if (currentHash != givenHash && (currentHash != splitHash || givenHash != splitHash)) {
+                    isConflict = true;
+                }
+            } else if (inCurrent && !inGiven) {
+                // 在当前分支中修改或删除，在给定分支中删除
+                if (currentHash != splitHash) {
+                    isConflict = true;
+                }
+            } else if (!inCurrent && inGiven) {
+                // 在当前分支中删除，在给定分支中修改
+                if (givenHash != splitHash) {
+                    isConflict = true;
+                }
+            }
+        } else {
+            // 文件在分割点不存在
+            if (inCurrent && inGiven && currentHash != givenHash) {
+                isConflict = true;
+            }
+        }
+        
+        if (isConflict) {
+            hasConflict = true;
+            // 解决冲突
+            std::string currentContent = "";
+            std::string givenContent = "";
+            
+            if (inCurrent) {
+                std::string blobPath = objectsDir + "/" + currentHash;
+                if (Utils::exists(blobPath)) {
+                    currentContent = Utils::readContentsAsString(blobPath);
+                }
+            }
+            
+            if (inGiven) {
+                std::string blobPath = objectsDir + "/" + givenHash;
+                if (Utils::exists(blobPath)) {
+                    givenContent = Utils::readContentsAsString(blobPath);
+                }
+            }
+            
+            // 创建冲突标记
+            std::ostringstream conflictContent;
+            conflictContent << "<<<<<<< HEAD\n";
+            conflictContent << currentContent;
+            if (!currentContent.empty() && currentContent.back() != '\n') {
+                conflictContent << "\n";
+            }
+            conflictContent << "=======\n";
+            conflictContent << givenContent;
+            if (!givenContent.empty() && givenContent.back() != '\n') {
+                conflictContent << "\n";
+            }
+            conflictContent << ">>>>>>>\n";
+            
+            std::string conflictStr = conflictContent.str();
+            Utils::writeContents(filename, conflictStr);
+            
+            // 计算并保存冲突文件的blob
+            std::string conflictHash = Utils::sha1(conflictStr);
+            std::string blobPath = objectsDir + "/" + conflictHash;
+            if (!Utils::exists(blobPath)) {
+                Utils::writeContents(blobPath, conflictStr);
+            }
+            
+            newStagedFiles[filename] = conflictHash;
+            allModifiedFiles.insert(filename);
+        }
+    }
+    
+    // 10. 更新暂存区
+    stagedFiles = newStagedFiles;
+    removedFiles = newRemovedFiles;
+    saveStaging();
+    
+    // 11. 处理结果
+    if (hasConflict) {
+        std::cout << "Encountered a merge conflict." << std::endl;
+    } else {
+        // 如果没有冲突，自动提交合并
+        // 检查是否有实际更改
+        if (allModifiedFiles.empty() && newRemovedFiles.empty()) {
+            // 根据要求："如果合并会因为提交本身没有更改而生成错误，则只让正常的提交错误消息通过。"
+            // 尝试提交，让commit函数处理"没有更改"的错误
+            commit("Merged " + branchName + " into " + currentBranch + ".", givenCommitHash);
+        } else {
+            // 创建合并提交
+            std::string message = "Merged " + branchName + " into " + currentBranch + ".";
+            
+            std::string parentHash = getHeadCommitHash();
+            
+            std::stringstream commitData;
+            commitData << message << "\n";
+            
+            // 写入父提交（两个）
+            if (parentHash.empty() || parentHash == "0") {
+                commitData << "0\n";
+            } else {
+                commitData << parentHash << "\n";
+            }
+            
+            // 第二个父提交
+            commitData << givenCommitHash << "\n";
+            
+            // 时间戳
+            std::time_t now = std::time(nullptr);
+            std::tm* gmt = std::gmtime(&now);
+            char timeBuffer[100];
+            std::strftime(timeBuffer, sizeof(timeBuffer), "%a %b %d %H:%M:%S %Y +0000", gmt);
+            commitData << timeBuffer << "\n";
+            
+            // 收集blob信息
+            std::map<std::string, std::string> blobs;
+            
+            // 从第一个父提交继承blob
+            if (!parentHash.empty() && parentHash != "0") {
+                std::string commitPath = objectsDir + "/" + parentHash;
+                if (Utils::exists(commitPath)) {
+                    std::string commitContent = Utils::readContentsAsString(commitPath);
+                    std::stringstream ss(commitContent);
+                    
+                    std::string line;
+                    std::getline(ss, line);  // 消息
+                    std::getline(ss, line);  // 第一个父提交
+                    std::getline(ss, line);  // 第二个父提交或时间戳
+                    if (line.find(":") == std::string::npos) {
+                        std::getline(ss, line);  // 时间戳
+                    }
+                    
+                    int blobCount;
+                    ss >> blobCount;
+                    
+                    for (int i = 0; i < blobCount; ++i) {
+                        std::string blobHash, blobFile;
+                        ss >> blobHash >> blobFile;
+                        blobs[blobFile] = blobHash;
+                    }
+                }
+            }
+            
+            // 添加暂存的文件
+            for (const auto& [filename, hash] : stagedFiles) {
+                blobs[filename] = hash;
+            }
+            
+            // 移除标记为删除的文件
+            for (const auto& filename : removedFiles) {
+                blobs.erase(filename);
+            }
+            
+            // 写入blob数量和信息
+            commitData << blobs.size() << "\n";
+            for (const auto& [filename, hash] : blobs) {
+                commitData << hash << " " << filename << "\n";
+            }
+            
+            // 保存提交
+            std::string commitContent = commitData.str();
+            std::string commitHash = Utils::sha1(commitContent);
+            std::string commitPath = objectsDir + "/" + commitHash;
+            Utils::writeContents(commitPath, commitContent);
+            
+            // 更新分支引用
+            std::string branchPath = gitliteDir + "/refs/heads/" + currentBranch;
+            Utils::writeContents(branchPath, commitHash + "\n");
+            
+            // 清空暂存区
+            stagedFiles.clear();
+            removedFiles.clear();
+            saveStaging();
+        }
+    }
+}
 // ==================== SomeObj 公共接口 ====================
 
 SomeObj::SomeObj() : pImpl(std::make_unique<Impl>()) {}
