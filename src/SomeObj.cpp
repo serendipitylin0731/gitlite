@@ -22,10 +22,12 @@ private:
     std::string headPath;
     std::string objectsDir;
     std::string stagingPath;
+    std::string remoteDir; // 远程仓库信息目录
     
     std::string currentBranch = "master";
     std::map<std::string, std::string> stagedFiles;  // filename -> blobHash
     std::set<std::string> removedFiles;
+    std::map<std::string, std::string> remotes; // remoteName -> remotePath
     
     // 辅助方法
     std::string getHeadCommitHash() const;
@@ -33,6 +35,8 @@ private:
     void loadHead();
     void saveStaging();
     void loadStaging();
+    void saveRemotes();
+    void loadRemotes();
     std::string formatTimestamp(const std::string& utcTimestamp) const;
     std::vector<std::string> getAllCommitHashes() const;
     std::string expandCommitId(const std::string& shortId) const;
@@ -51,6 +55,12 @@ private:
                                        const std::string& branchName);
     std::map<std::string, std::string> getCommitFiles(const std::string& commitHash) const;
     bool filesEqual(const std::string& file1, const std::string& file2) const;
+    
+    // 远程相关辅助方法
+    std::string getRemoteBranchHash(const std::string& remoteName, const std::string& branchName) const;
+    void copyObjectIfNotExists(const std::string& objectHash, const std::string& remoteObjectsDir) const;
+    void copyCommitAndBlobs(const std::string& commitHash, const std::string& remoteObjectsDir) const;
+    bool isAncestor(const std::string& ancestor, const std::string& descendant) const;
     
 public:
     Impl();
@@ -71,12 +81,12 @@ public:
     void reset(const std::string&);
     void merge(const std::string&);
 
-    // 其他方法保持空实现
-    void addRemote(const std::string&, const std::string&) {}
-    void rmRemote(const std::string&) {}
-    void push(const std::string&, const std::string&) {}
-    void fetch(const std::string&, const std::string&) {}
-    void pull(const std::string&, const std::string&) {}
+    // 远程方法
+    void addRemote(const std::string& remoteName, const std::string& directory);
+    void rmRemote(const std::string& remoteName);
+    void push(const std::string& remoteName, const std::string& branchName);
+    void fetch(const std::string& remoteName, const std::string& branchName);
+    void pull(const std::string& remoteName, const std::string& branchName);
 };
 
 // ==================== 构造函数和基础方法 ====================
@@ -85,10 +95,12 @@ SomeObj::Impl::Impl() {
     headPath = gitliteDir + "/HEAD";
     objectsDir = gitliteDir + "/objects";
     stagingPath = gitliteDir + "/STAGING";
+    remoteDir = gitliteDir + "/remotes";
     
     if (Utils::exists(gitliteDir)) {
         loadHead();
         loadStaging();
+        loadRemotes();
     }
 }
 
@@ -169,6 +181,35 @@ void SomeObj::Impl::loadStaging() {
     }
 }
 
+void SomeObj::Impl::saveRemotes() {
+    Utils::createDirectories(remoteDir);
+    std::stringstream ss;
+    ss << remotes.size() << "\n";
+    for (const auto& [remoteName, remotePath] : remotes) {
+        ss << remoteName << "\n" << remotePath << "\n";
+    }
+    Utils::writeContents(remoteDir + "/REMOTES", ss.str());
+}
+
+void SomeObj::Impl::loadRemotes() {
+    std::string remotesPath = remoteDir + "/REMOTES";
+    if (!Utils::exists(remotesPath)) return;
+    
+    std::string content = Utils::readContentsAsString(remotesPath);
+    std::stringstream ss(content);
+    
+    remotes.clear();
+    
+    size_t remoteCount;
+    ss >> remoteCount;
+    
+    for (size_t i = 0; i < remoteCount; ++i) {
+        std::string remoteName, remotePath;
+        ss >> remoteName >> remotePath;
+        remotes[remoteName] = remotePath;
+    }
+}
+
 // ==================== Subtask1 方法 ====================
 
 void SomeObj::Impl::init() {
@@ -185,6 +226,9 @@ void SomeObj::Impl::init() {
     stagedFiles.clear();
     removedFiles.clear();
     saveStaging();
+    
+    remotes.clear();
+    saveRemotes();
 }
 
 void SomeObj::Impl::add(const std::string& filename) {
@@ -545,38 +589,72 @@ void SomeObj::Impl::restoreFileFromCommit(const std::string& commitHash, const s
     Utils::writeContents(filename, fileContent);
 }
 
-// ==================== Subtask2 主要方法 ====================
+// ==================== 改进的status方法 ====================
 
 void SomeObj::Impl::status() {
+    // === Branches ===
     std::cout << "=== Branches ===" << std::endl;
-    std::cout << "*" << currentBranch << std::endl;
     
+    // 获取所有本地分支
     std::string branchesDir = gitliteDir + "/refs/heads";
+    std::set<std::string> branchSet;
+    
     if (Utils::exists(branchesDir)) {
         for (const auto& entry : fs::directory_iterator(branchesDir)) {
             std::string branchName = entry.path().filename().string();
-            if (branchName != currentBranch) {
-                std::cout << branchName << std::endl;
+            branchSet.insert(branchName);
+        }
+    }
+    
+    // 添加远程分支
+    for (const auto& [remoteName, remotePath] : remotes) {
+        std::string remoteBranchesDir = remotePath + "/refs/heads";
+        if (Utils::exists(remoteBranchesDir)) {
+            for (const auto& entry : fs::directory_iterator(remoteBranchesDir)) {
+                std::string branchName = entry.path().filename().string();
+                std::string remoteBranchName = remoteName + "/" + branchName;
+                branchSet.insert(remoteBranchName);
             }
         }
     }
     
+    // 先打印当前分支（带*）
+    std::cout << "*" << currentBranch << std::endl;
+    
+    // 按字典序打印其他分支
+    for (const auto& branchName : branchSet) {
+        if (branchName != currentBranch) {
+            std::cout << branchName << std::endl;
+        }
+    }
+    
+    // === Staged Files ===
     std::cout << std::endl << "=== Staged Files ===" << std::endl;
+    std::set<std::string> stagedFileNames;
     for (const auto& [filename, hash] : stagedFiles) {
+        stagedFileNames.insert(filename);
+    }
+    for (const auto& filename : stagedFileNames) {
         std::cout << filename << std::endl;
     }
     
+    // === Removed Files ===
     std::cout << std::endl << "=== Removed Files ===" << std::endl;
-    for (const auto& filename : removedFiles) {
+    std::set<std::string> removedFileSet(removedFiles.begin(), removedFiles.end());
+    for (const auto& filename : removedFileSet) {
         std::cout << filename << std::endl;
     }
     
+    // === Modifications Not Staged For Commit ===
     std::cout << std::endl << "=== Modifications Not Staged For Commit ===" << std::endl;
     // 留空，按题目要求
     
+    // === Untracked Files ===
     std::cout << std::endl << "=== Untracked Files ===" << std::endl;
     // 留空，按题目要求
 }
+
+// ==================== Subtask2 主要方法 ====================
 
 void SomeObj::Impl::log() {
     std::string commitHash = getHeadCommitHash();
@@ -635,6 +713,22 @@ void SomeObj::Impl::checkoutFileInCommit(const std::string& commitId, const std:
 // ==================== Subtask3 方法 (checkout branch) ====================
 
 void SomeObj::Impl::checkoutBranch(const std::string& branchName) {
+    // 检查是否是远程分支
+    bool isRemoteBranch = false;
+    std::string actualBranchName = branchName;
+    
+    for (const auto& [remoteName, remotePath] : remotes) {
+        if (branchName.find(remoteName + "/") == 0) {
+            isRemoteBranch = true;
+            break;
+        }
+    }
+    
+    if (isRemoteBranch) {
+        // 对于远程分支，不允许直接checkout
+        Utils::exitWithMessage("No such branch exists.");
+    }
+    
     // 检查分支是否存在
     std::string branchPath = gitliteDir + "/refs/heads/" + branchName;
     if (!Utils::exists(branchPath)) {
@@ -680,7 +774,7 @@ void SomeObj::Impl::checkoutBranch(const std::string& branchName) {
         }
     }
     
-    // 检查是否有未跟踪文件会被覆盖
+    // 获取当前提交的文件列表
     std::set<std::string> currentFiles;
     if (!currentCommitHash.empty() && currentCommitHash != "0") {
         std::string commitPath = objectsDir + "/" + currentCommitHash;
@@ -768,7 +862,17 @@ void SomeObj::Impl::rmBranch(const std::string& branchName) {
         Utils::exitWithMessage("Cannot remove the current branch.");
     }
     
-    // 3. 删除分支文件
+    // 3. 检查是否是远程分支（格式为 remote/branch）
+    size_t slashPos = branchName.find('/');
+    if (slashPos != std::string::npos) {
+        std::string remoteName = branchName.substr(0, slashPos);
+        if (remotes.find(remoteName) != remotes.end()) {
+            // 这是远程分支，不能直接删除
+            Utils::exitWithMessage("Cannot remove a remote branch directly. Use rm-remote instead.");
+        }
+    }
+    
+    // 4. 删除分支文件
     // 直接删除文件，不调用Utils::restrictedDelete
     if (std::remove(branchPath.c_str()) != 0) {
         // 如果删除失败，可能是因为文件被锁定或其他原因
@@ -1489,7 +1593,339 @@ void SomeObj::Impl::merge(const std::string& branchName) {
     if (hasConflict) {
         std::cout << "Encountered a merge conflict." << std::endl;
     }
+    // 注意：不在merge命令中打印log，log命令会在后续调用时显示
 }
+
+// ==================== 远程相关辅助方法 ====================
+
+std::string SomeObj::Impl::getRemoteBranchHash(const std::string& remoteName, const std::string& branchName) const {
+    auto it = remotes.find(remoteName);
+    if (it == remotes.end()) {
+        return "";
+    }
+    
+    std::string remotePath = it->second;
+    std::string remoteBranchPath = remotePath + "/refs/heads/" + branchName;
+    
+    if (!Utils::exists(remoteBranchPath)) {
+        return "";
+    }
+    
+    std::string content = Utils::readContentsAsString(remoteBranchPath);
+    if (!content.empty() && content.back() == '\n') {
+        content.pop_back();
+    }
+    
+    return content;
+}
+
+void SomeObj::Impl::copyObjectIfNotExists(const std::string& objectHash, const std::string& remoteObjectsDir) const {
+    std::string localObjectPath = objectsDir + "/" + objectHash;
+    std::string remoteObjectPath = remoteObjectsDir + "/" + objectHash;
+    
+    if (!Utils::exists(remoteObjectPath) && Utils::exists(localObjectPath)) {
+        std::string content = Utils::readContentsAsString(localObjectPath);
+        Utils::writeContents(remoteObjectPath, content);
+    }
+}
+
+void SomeObj::Impl::copyCommitAndBlobs(const std::string& commitHash, const std::string& remoteObjectsDir) const {
+    if (commitHash.empty() || commitHash == "0") {
+        return;
+    }
+    
+    // 如果已经存在，直接返回
+    std::string remoteCommitPath = remoteObjectsDir + "/" + commitHash;
+    if (Utils::exists(remoteCommitPath)) {
+        return;
+    }
+    
+    // 复制提交对象
+    std::string localCommitPath = objectsDir + "/" + commitHash;
+    if (!Utils::exists(localCommitPath)) {
+        return;
+    }
+    
+    std::string commitContent = Utils::readContentsAsString(localCommitPath);
+    Utils::writeContents(remoteCommitPath, commitContent);
+    
+    // 解析提交内容，获取父提交和blobs
+    std::stringstream ss(commitContent);
+    std::string line;
+    
+    std::getline(ss, line); // 消息
+    std::getline(ss, line); // 第一个父提交
+    
+    // 复制第一个父提交
+    if (!line.empty() && line != "0") {
+        copyCommitAndBlobs(line, remoteObjectsDir);
+    }
+    
+    // 检查是否有第二个父提交
+    std::getline(ss, line);
+    if (line.find(":") == std::string::npos) {
+        // 这是第二个父提交
+        if (!line.empty() && line != "0") {
+            copyCommitAndBlobs(line, remoteObjectsDir);
+        }
+        std::getline(ss, line); // 时间戳
+    }
+    
+    // 复制blobs
+    int blobCount;
+    ss >> blobCount;
+    
+    for (int i = 0; i < blobCount; ++i) {
+        std::string blobHash, filename;
+        ss >> blobHash >> filename;
+        copyObjectIfNotExists(blobHash, remoteObjectsDir);
+    }
+}
+
+bool SomeObj::Impl::isAncestor(const std::string& ancestor, const std::string& descendant) const {
+    if (ancestor == descendant) {
+        return true;
+    }
+    
+    std::queue<std::string> queue;
+    std::set<std::string> visited;
+    
+    queue.push(descendant);
+    visited.insert(descendant);
+    
+    while (!queue.empty()) {
+        std::string current = queue.front();
+        queue.pop();
+        
+        if (current == ancestor) {
+            return true;
+        }
+        
+        if (current.empty() || current == "0") {
+            continue;
+        }
+        
+        std::string commitPath = objectsDir + "/" + current;
+        if (!Utils::exists(commitPath)) {
+            continue;
+        }
+        
+        std::string content = Utils::readContentsAsString(commitPath);
+        std::stringstream ss(content);
+        
+        std::string line;
+        std::getline(ss, line); // 消息
+        std::getline(ss, line); // 第一个父提交
+        
+        if (!line.empty() && line != "0" && visited.find(line) == visited.end()) {
+            queue.push(line);
+            visited.insert(line);
+        }
+        
+        // 检查是否有第二个父提交
+        std::getline(ss, line);
+        if (line.find(":") == std::string::npos) {
+            if (!line.empty() && line != "0" && visited.find(line) == visited.end()) {
+                queue.push(line);
+                visited.insert(line);
+            }
+            std::getline(ss, line); // 时间戳
+        }
+    }
+    
+    return false;
+}
+
+// ==================== 远程相关方法 ====================
+
+void SomeObj::Impl::addRemote(const std::string& remoteName, const std::string& directory) {
+    // 检查远程是否已存在
+    if (remotes.find(remoteName) != remotes.end()) {
+        Utils::exitWithMessage("A remote with that name already exists.");
+    }
+    
+    // 转换路径分隔符
+    std::string remotePath = directory;
+    #ifdef _WIN32
+        std::replace(remotePath.begin(), remotePath.end(), '/', '\\');
+    #else
+        std::replace(remotePath.begin(), remotePath.end(), '\\', '/');
+    #endif
+    
+    // 移除末尾的/.gitlite（如果存在）
+    if (remotePath.length() >= 9 && remotePath.substr(remotePath.length() - 9) == "/.gitlite") {
+        remotePath = remotePath.substr(0, remotePath.length() - 9);
+    }
+    
+    // 检查远程目录是否存在
+    if (!Utils::exists(remotePath + "/.gitlite")) {
+        // 不检查合法性，只保存路径
+    }
+    
+    remotes[remoteName] = remotePath;
+    saveRemotes();
+}
+
+void SomeObj::Impl::rmRemote(const std::string& remoteName) {
+    // 检查远程是否存在
+    if (remotes.find(remoteName) == remotes.end()) {
+        Utils::exitWithMessage("A remote with that name does not exist.");
+    }
+    
+    remotes.erase(remoteName);
+    saveRemotes();
+}
+
+void SomeObj::Impl::push(const std::string& remoteName, const std::string& branchName) {
+    // 检查远程是否存在
+    auto it = remotes.find(remoteName);
+    if (it == remotes.end()) {
+        Utils::exitWithMessage("Remote directory not found.");
+    }
+    
+    std::string remotePath = it->second;
+    std::string remoteGitlitePath = remotePath + "/.gitlite";
+    
+    // 检查远程目录是否存在
+    if (!Utils::exists(remoteGitlitePath)) {
+        Utils::exitWithMessage("Remote directory not found.");
+    }
+    
+    // 获取本地分支的HEAD
+    std::string localHead = getHeadCommitHash();
+    if (localHead.empty()) {
+        Utils::exitWithMessage("No commits in current branch.");
+    }
+    
+    // 获取远程分支的HEAD
+    std::string remoteBranchPath = remoteGitlitePath + "/refs/heads/" + branchName;
+    std::string remoteHead = "";
+    
+    if (Utils::exists(remoteBranchPath)) {
+        remoteHead = Utils::readContentsAsString(remoteBranchPath);
+        if (!remoteHead.empty() && remoteHead.back() == '\n') {
+            remoteHead.pop_back();
+        }
+    }
+    
+    // 检查远程分支的HEAD是否在本地分支的历史中
+    if (!remoteHead.empty() && !isAncestor(remoteHead, localHead)) {
+        Utils::exitWithMessage("Please pull down remote changes before pushing.");
+    }
+    
+    // 复制所有必要的对象到远程仓库
+    std::string remoteObjectsDir = remoteGitlitePath + "/objects";
+    copyCommitAndBlobs(localHead, remoteObjectsDir);
+    
+    // 更新远程分支引用
+    Utils::writeContents(remoteBranchPath, localHead + "\n");
+}
+
+void SomeObj::Impl::fetch(const std::string& remoteName, const std::string& branchName) {
+    // 检查远程是否存在
+    auto it = remotes.find(remoteName);
+    if (it == remotes.end()) {
+        Utils::exitWithMessage("Remote directory not found.");
+    }
+    
+    std::string remotePath = it->second;
+    std::string remoteGitlitePath = remotePath + "/.gitlite";
+    
+    // 检查远程目录是否存在
+    if (!Utils::exists(remoteGitlitePath)) {
+        Utils::exitWithMessage("Remote directory not found.");
+    }
+    
+    // 检查远程分支是否存在
+    std::string remoteBranchPath = remoteGitlitePath + "/refs/heads/" + branchName;
+    if (!Utils::exists(remoteBranchPath)) {
+        Utils::exitWithMessage("That remote does not have that branch.");
+    }
+    
+    // 获取远程分支的HEAD
+    std::string remoteHead = Utils::readContentsAsString(remoteBranchPath);
+    if (!remoteHead.empty() && remoteHead.back() == '\n') {
+        remoteHead.pop_back();
+    }
+    
+    // 从远程复制所有必要的对象到本地
+    std::string remoteObjectsDir = remoteGitlitePath + "/objects";
+    
+    // 复制提交及其所有祖先和blobs
+    std::queue<std::string> commitsToCopy;
+    std::set<std::string> copiedCommits;
+    
+    commitsToCopy.push(remoteHead);
+    copiedCommits.insert(remoteHead);
+    
+    while (!commitsToCopy.empty()) {
+        std::string commitHash = commitsToCopy.front();
+        commitsToCopy.pop();
+        
+        // 复制提交对象
+        std::string remoteCommitPath = remoteObjectsDir + "/" + commitHash;
+        std::string localCommitPath = objectsDir + "/" + commitHash;
+        
+        if (Utils::exists(remoteCommitPath) && !Utils::exists(localCommitPath)) {
+            std::string commitContent = Utils::readContentsAsString(remoteCommitPath);
+            Utils::writeContents(localCommitPath, commitContent);
+            
+            // 解析提交内容，获取父提交
+            std::stringstream ss(commitContent);
+            std::string line;
+            
+            std::getline(ss, line); // 消息
+            std::getline(ss, line); // 第一个父提交
+            
+            if (!line.empty() && line != "0" && copiedCommits.find(line) == copiedCommits.end()) {
+                commitsToCopy.push(line);
+                copiedCommits.insert(line);
+            }
+            
+            // 检查是否有第二个父提交
+            std::getline(ss, line);
+            if (line.find(":") == std::string::npos) {
+                if (!line.empty() && line != "0" && copiedCommits.find(line) == copiedCommits.end()) {
+                    commitsToCopy.push(line);
+                    copiedCommits.insert(line);
+                }
+                std::getline(ss, line); // 时间戳
+            }
+            
+            // 复制blobs
+            int blobCount;
+            ss >> blobCount;
+            
+            for (int i = 0; i < blobCount; ++i) {
+                std::string blobHash, filename;
+                ss >> blobHash >> filename;
+                
+                std::string remoteBlobPath = remoteObjectsDir + "/" + blobHash;
+                std::string localBlobPath = objectsDir + "/" + blobHash;
+                
+                if (Utils::exists(remoteBlobPath) && !Utils::exists(localBlobPath)) {
+                    std::string blobContent = Utils::readContentsAsString(remoteBlobPath);
+                    Utils::writeContents(localBlobPath, blobContent);
+                }
+            }
+        }
+    }
+    
+    // 在本地创建远程分支引用
+    std::string localRemoteBranchName = remoteName + "/" + branchName;
+    std::string localRemoteBranchPath = gitliteDir + "/refs/heads/" + localRemoteBranchName;
+    Utils::writeContents(localRemoteBranchPath, remoteHead + "\n");
+}
+
+void SomeObj::Impl::pull(const std::string& remoteName, const std::string& branchName) {
+    // 先fetch
+    fetch(remoteName, branchName);
+    
+    // 然后merge
+    std::string remoteBranchName = remoteName + "/" + branchName;
+    merge(remoteBranchName);
+}
+
 // ==================== SomeObj 公共接口 ====================
 
 SomeObj::SomeObj() : pImpl(std::make_unique<Impl>()) {}
@@ -1512,8 +1948,20 @@ void SomeObj::branch(const std::string& branchName) { pImpl->branch(branchName);
 void SomeObj::rmBranch(const std::string& branchName) { pImpl->rmBranch(branchName); }
 void SomeObj::reset(const std::string& commitId) { pImpl->reset(commitId); }
 void SomeObj::merge(const std::string& branchName) { pImpl->merge(branchName); }
-void SomeObj::addRemote(const std::string& remoteName, const std::string& directory) { pImpl->addRemote(remoteName, directory); }
-void SomeObj::rmRemote(const std::string& remoteName) { pImpl->rmRemote(remoteName); }
-void SomeObj::push(const std::string& remoteName, const std::string& branchName) { pImpl->push(remoteName, branchName); }
-void SomeObj::fetch(const std::string& remoteName, const std::string& branchName) { pImpl->fetch(remoteName, branchName); }
-void SomeObj::pull(const std::string& remoteName, const std::string& branchName) { pImpl->pull(remoteName, branchName); }
+
+// 远程方法实现
+void SomeObj::addRemote(const std::string& remoteName, const std::string& directory) { 
+    pImpl->addRemote(remoteName, directory); 
+}
+void SomeObj::rmRemote(const std::string& remoteName) { 
+    pImpl->rmRemote(remoteName); 
+}
+void SomeObj::push(const std::string& remoteName, const std::string& branchName) { 
+    pImpl->push(remoteName, branchName); 
+}
+void SomeObj::fetch(const std::string& remoteName, const std::string& branchName) { 
+    pImpl->fetch(remoteName, branchName); 
+}
+void SomeObj::pull(const std::string& remoteName, const std::string& branchName) { 
+    pImpl->pull(remoteName, branchName); 
+}
