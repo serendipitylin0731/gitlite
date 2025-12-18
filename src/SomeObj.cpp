@@ -1255,7 +1255,6 @@ void SomeObj::Impl::merge(const std::string& branchName) {
     
     // 9. 执行合并，跟踪修改和冲突
     bool hasConflict = false;
-    std::set<std::string> allModifiedFiles;
     
     // 收集所有涉及的文件
     std::set<std::string> allFiles;
@@ -1282,7 +1281,6 @@ void SomeObj::Impl::merge(const std::string& branchName) {
                 // 从给定分支恢复文件
                 restoreFileFromCommit(givenCommitHash, filename);
                 newStagedFiles[filename] = givenHash;
-                allModifiedFiles.insert(filename);
                 continue;
             }
         }
@@ -1292,7 +1290,6 @@ void SomeObj::Impl::merge(const std::string& branchName) {
             // 恢复给定分支的版本
             restoreFileFromCommit(givenCommitHash, filename);
             newStagedFiles[filename] = givenHash;
-            allModifiedFiles.insert(filename);
             continue;
         }
         
@@ -1304,7 +1301,6 @@ void SomeObj::Impl::merge(const std::string& branchName) {
                     Utils::restrictedDelete(filename);
                 }
                 newRemovedFiles.insert(filename);
-                allModifiedFiles.insert(filename);
                 continue;
             }
         }
@@ -1397,111 +1393,101 @@ void SomeObj::Impl::merge(const std::string& branchName) {
             }
             
             newStagedFiles[filename] = conflictHash;
-            allModifiedFiles.insert(filename);
         }
     }
     
     // 10. 更新暂存区
     stagedFiles = newStagedFiles;
     removedFiles = newRemovedFiles;
+    
+    // 11. 创建合并提交（无论是否有冲突）
+    std::string message = "Merged " + branchName + " into " + currentBranch + ".";
+    
+    std::string parentHash = getHeadCommitHash();
+    
+    std::stringstream commitData;
+    commitData << message << "\n";
+    
+    // 写入父提交（两个）
+    if (parentHash.empty() || parentHash == "0") {
+        commitData << "0\n";
+    } else {
+        commitData << parentHash << "\n";
+    }
+    
+    // 第二个父提交
+    commitData << givenCommitHash << "\n";
+    
+    // 时间戳
+    std::time_t now = std::time(nullptr);
+    std::tm* gmt = std::gmtime(&now);
+    char timeBuffer[100];
+    std::strftime(timeBuffer, sizeof(timeBuffer), "%a %b %d %H:%M:%S %Y +0000", gmt);
+    commitData << timeBuffer << "\n";
+    
+    // 收集blob信息
+    std::map<std::string, std::string> blobs;
+    
+    // 从第一个父提交继承blob
+    if (!parentHash.empty() && parentHash != "0") {
+        std::string commitPath = objectsDir + "/" + parentHash;
+        if (Utils::exists(commitPath)) {
+            std::string commitContent = Utils::readContentsAsString(commitPath);
+            std::stringstream ss(commitContent);
+            
+            std::string line;
+            std::getline(ss, line);  // 消息
+            std::getline(ss, line);  // 第一个父提交
+            std::getline(ss, line);  // 第二个父提交或时间戳
+            if (line.find(":") == std::string::npos) {
+                std::getline(ss, line);  // 时间戳
+            }
+            
+            int blobCount;
+            ss >> blobCount;
+            
+            for (int i = 0; i < blobCount; ++i) {
+                std::string blobHash, blobFile;
+                ss >> blobHash >> blobFile;
+                blobs[blobFile] = blobHash;
+            }
+        }
+    }
+    
+    // 添加暂存的文件（包括冲突文件）
+    for (const auto& [filename, hash] : stagedFiles) {
+        blobs[filename] = hash;
+    }
+    
+    // 移除标记为删除的文件
+    for (const auto& filename : removedFiles) {
+        blobs.erase(filename);
+    }
+    
+    // 写入blob数量和信息
+    commitData << blobs.size() << "\n";
+    for (const auto& [filename, hash] : blobs) {
+        commitData << hash << " " << filename << "\n";
+    }
+    
+    // 保存提交
+    std::string commitContent = commitData.str();
+    std::string commitHash = Utils::sha1(commitContent);
+    std::string commitPath = objectsDir + "/" + commitHash;
+    Utils::writeContents(commitPath, commitContent);
+    
+    // 更新分支引用
+    std::string branchPath = gitliteDir + "/refs/heads/" + currentBranch;
+    Utils::writeContents(branchPath, commitHash + "\n");
+    
+    // 12. 清空暂存区
+    stagedFiles.clear();
+    removedFiles.clear();
     saveStaging();
     
-    // 11. 处理结果
+    // 13. 处理结果
     if (hasConflict) {
         std::cout << "Encountered a merge conflict." << std::endl;
-    } else {
-        // 如果没有冲突，自动提交合并
-        // 检查是否有实际更改
-        if (allModifiedFiles.empty() && newRemovedFiles.empty()) {
-            // 根据要求："如果合并会因为提交本身没有更改而生成错误，则只让正常的提交错误消息通过。"
-            // 尝试提交，让commit函数处理"没有更改"的错误
-            commit("Merged " + branchName + " into " + currentBranch + ".", givenCommitHash);
-        } else {
-            // 创建合并提交
-            std::string message = "Merged " + branchName + " into " + currentBranch + ".";
-            
-            std::string parentHash = getHeadCommitHash();
-            
-            std::stringstream commitData;
-            commitData << message << "\n";
-            
-            // 写入父提交（两个）
-            if (parentHash.empty() || parentHash == "0") {
-                commitData << "0\n";
-            } else {
-                commitData << parentHash << "\n";
-            }
-            
-            // 第二个父提交
-            commitData << givenCommitHash << "\n";
-            
-            // 时间戳
-            std::time_t now = std::time(nullptr);
-            std::tm* gmt = std::gmtime(&now);
-            char timeBuffer[100];
-            std::strftime(timeBuffer, sizeof(timeBuffer), "%a %b %d %H:%M:%S %Y +0000", gmt);
-            commitData << timeBuffer << "\n";
-            
-            // 收集blob信息
-            std::map<std::string, std::string> blobs;
-            
-            // 从第一个父提交继承blob
-            if (!parentHash.empty() && parentHash != "0") {
-                std::string commitPath = objectsDir + "/" + parentHash;
-                if (Utils::exists(commitPath)) {
-                    std::string commitContent = Utils::readContentsAsString(commitPath);
-                    std::stringstream ss(commitContent);
-                    
-                    std::string line;
-                    std::getline(ss, line);  // 消息
-                    std::getline(ss, line);  // 第一个父提交
-                    std::getline(ss, line);  // 第二个父提交或时间戳
-                    if (line.find(":") == std::string::npos) {
-                        std::getline(ss, line);  // 时间戳
-                    }
-                    
-                    int blobCount;
-                    ss >> blobCount;
-                    
-                    for (int i = 0; i < blobCount; ++i) {
-                        std::string blobHash, blobFile;
-                        ss >> blobHash >> blobFile;
-                        blobs[blobFile] = blobHash;
-                    }
-                }
-            }
-            
-            // 添加暂存的文件
-            for (const auto& [filename, hash] : stagedFiles) {
-                blobs[filename] = hash;
-            }
-            
-            // 移除标记为删除的文件
-            for (const auto& filename : removedFiles) {
-                blobs.erase(filename);
-            }
-            
-            // 写入blob数量和信息
-            commitData << blobs.size() << "\n";
-            for (const auto& [filename, hash] : blobs) {
-                commitData << hash << " " << filename << "\n";
-            }
-            
-            // 保存提交
-            std::string commitContent = commitData.str();
-            std::string commitHash = Utils::sha1(commitContent);
-            std::string commitPath = objectsDir + "/" + commitHash;
-            Utils::writeContents(commitPath, commitContent);
-            
-            // 更新分支引用
-            std::string branchPath = gitliteDir + "/refs/heads/" + currentBranch;
-            Utils::writeContents(branchPath, commitHash + "\n");
-            
-            // 清空暂存区
-            stagedFiles.clear();
-            removedFiles.clear();
-            saveStaging();
-        }
     }
 }
 // ==================== SomeObj 公共接口 ====================
