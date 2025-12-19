@@ -594,36 +594,18 @@ void SomeObj::Impl::restoreFileFromCommit(const std::string& commitHash, const s
 void SomeObj::Impl::status() {
     // === Branches ===
     std::cout << "=== Branches ===" << std::endl;
-    
-    // 获取所有本地分支
-    std::string branchesDir = gitliteDir + "/refs/heads";
-    std::set<std::string> branchSet;
-    
-    if (Utils::exists(branchesDir)) {
-        for (const auto& entry : fs::directory_iterator(branchesDir)) {
-            std::string branchName = entry.path().filename().string();
-            branchSet.insert(branchName);
-        }
-    }
-    
-    // 添加远程分支
-    for (const auto& [remoteName, remotePath] : remotes) {
-        std::string remoteBranchesDir = remotePath + "/refs/heads";
-        if (Utils::exists(remoteBranchesDir)) {
-            for (const auto& entry : fs::directory_iterator(remoteBranchesDir)) {
-                std::string branchName = entry.path().filename().string();
-                std::string remoteBranchName = remoteName + "/" + branchName;
-                branchSet.insert(remoteBranchName);
-            }
-        }
-    }
-    
-    // 先打印当前分支（带*）
     std::cout << "*" << currentBranch << std::endl;
     
-    // 按字典序打印其他分支
-    for (const auto& branchName : branchSet) {
-        if (branchName != currentBranch) {
+    std::string branchesDir = gitliteDir + "/refs/heads";
+    if (Utils::exists(branchesDir)) {
+        std::set<std::string> otherBranches;
+        for (const auto& entry : fs::directory_iterator(branchesDir)) {
+            std::string branchName = entry.path().filename().string();
+            if (branchName != currentBranch) {
+                otherBranches.insert(branchName);
+            }
+        }
+        for (const auto& branchName : otherBranches) {
             std::cout << branchName << std::endl;
         }
     }
@@ -647,11 +629,120 @@ void SomeObj::Impl::status() {
     
     // === Modifications Not Staged For Commit ===
     std::cout << std::endl << "=== Modifications Not Staged For Commit ===" << std::endl;
-    // 留空，按题目要求
+    
+    // 获取当前提交的文件
+    std::string currentCommitHash = getHeadCommitHash();
+    std::map<std::string, std::string> commitFiles;
+    
+    if (!currentCommitHash.empty() && currentCommitHash != "0") {
+        commitFiles = getCommitFiles(currentCommitHash);
+    }
+    
+    // 获取工作目录中所有普通文件
+    std::set<std::string> workingDirFiles;
+    try {
+        for (const auto& entry : fs::directory_iterator(".")) {
+            if (entry.is_regular_file()) {
+                std::string filename = entry.path().filename().string();
+                if (filename != ".gitlite" && filename[0] != '.') {
+                    workingDirFiles.insert(filename);
+                }
+            }
+        }
+    } catch (...) {
+        // 忽略错误
+    }
+    
+    std::set<std::string> modifications;
+    
+    // 1. 在当前提交中跟踪，在工作目录中更改，但未暂存
+    for (const auto& [filename, commitHash] : commitFiles) {
+        if (workingDirFiles.find(filename) != workingDirFiles.end()) {
+            // 文件在工作目录中存在
+            std::string workingContent = Utils::readContentsAsString(filename);
+            std::string workingHash = Utils::sha1(workingContent);
+            
+            // 检查是否在暂存区
+            bool isStaged = (stagedFiles.find(filename) != stagedFiles.end());
+            
+            if (!isStaged) {
+                // 不在暂存区，且内容与提交不同
+                if (workingHash != commitHash) {
+                    modifications.insert(filename + " (modified)");
+                }
+            }
+        }
+    }
+    
+    // 2. 已保存在添加暂存区，但内容与工作目录不同
+    for (const auto& [filename, stagedHash] : stagedFiles) {
+        if (workingDirFiles.find(filename) != workingDirFiles.end()) {
+            // 文件在工作目录中存在
+            std::string workingContent = Utils::readContentsAsString(filename);
+            std::string workingHash = Utils::sha1(workingContent);
+            
+            if (workingHash != stagedHash) {
+                modifications.insert(filename + " (modified)");
+            }
+        }
+    }
+    
+    // 3. 已保存在添加暂存区，但在工作目录中已删除
+    for (const auto& [filename, stagedHash] : stagedFiles) {
+        if (workingDirFiles.find(filename) == workingDirFiles.end()) {
+            // 文件不在工作目录中
+            modifications.insert(filename + " (deleted)");
+        }
+    }
+    
+    // 4. 未在删除暂存区，但在当前提交中被跟踪并已从工作目录中删除
+    for (const auto& [filename, commitHash] : commitFiles) {
+        if (workingDirFiles.find(filename) == workingDirFiles.end()) {
+            // 文件不在工作目录中
+            bool isStaged = (stagedFiles.find(filename) != stagedFiles.end());
+            bool isRemoved = (removedFiles.find(filename) != removedFiles.end());
+            
+            if (!isStaged && !isRemoved) {
+                modifications.insert(filename + " (deleted)");
+            }
+        }
+    }
+    
+    // 输出修改
+    for (const auto& modification : modifications) {
+        std::cout << modification << std::endl;
+    }
     
     // === Untracked Files ===
     std::cout << std::endl << "=== Untracked Files ===" << std::endl;
-    // 留空，按题目要求
+    
+    std::set<std::string> untrackedFiles;
+    
+    for (const auto& filename : workingDirFiles) {
+        // 检查是否在提交中
+        bool inCommit = (commitFiles.find(filename) != commitFiles.end());
+        
+        // 检查是否在暂存区
+        bool inStaged = (stagedFiles.find(filename) != stagedFiles.end());
+        
+        // 检查是否在删除暂存区
+        bool inRemoved = (removedFiles.find(filename) != removedFiles.end());
+        
+        // 未跟踪文件：既不在提交中，也不在暂存区
+        if (!inCommit && !inStaged) {
+            untrackedFiles.insert(filename);
+        }
+        
+        // 特殊情况：已暂存待删除但随后重新创建的文件
+        if (inRemoved) {
+            untrackedFiles.insert(filename);
+        }
+    }
+    
+    // 输出未跟踪文件
+    for (const auto& filename : untrackedFiles) {
+        std::cout << filename << std::endl;
+    }
 }
 
 // ==================== Subtask2 主要方法 ====================
