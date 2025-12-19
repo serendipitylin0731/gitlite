@@ -713,23 +713,14 @@ void SomeObj::Impl::checkoutFileInCommit(const std::string& commitId, const std:
 // ==================== Subtask3 方法 (checkout branch) ====================
 
 void SomeObj::Impl::checkoutBranch(const std::string& branchName) {
-    // 检查是否是远程分支
-    bool isRemoteBranch = false;
-    std::string actualBranchName = branchName;
-    
-    for (const auto& [remoteName, remotePath] : remotes) {
-        if (branchName.find(remoteName + "/") == 0) {
-            isRemoteBranch = true;
-            break;
-        }
+    // 检查是否是远程分支格式（remote/branch）
+    bool isRemoteFormat = false;
+    size_t slashPos = branchName.find('/');
+    if (slashPos != std::string::npos) {
+        isRemoteFormat = true;
     }
     
-    if (isRemoteBranch) {
-        // 对于远程分支，不允许直接checkout
-        Utils::exitWithMessage("No such branch exists.");
-    }
-    
-    // 检查分支是否存在
+    // 检查分支是否存在（包括本地分支和远程分支引用）
     std::string branchPath = gitliteDir + "/refs/heads/" + branchName;
     if (!Utils::exists(branchPath)) {
         Utils::exitWithMessage("No such branch exists.");
@@ -749,7 +740,7 @@ void SomeObj::Impl::checkoutBranch(const std::string& branchName) {
     // 获取当前分支的提交哈希
     std::string currentCommitHash = getHeadCommitHash();
     
-    //  获取目标提交的文件列表
+    // 获取目标提交的文件列表
     std::set<std::string> targetFiles;
     if (!targetCommitHash.empty() && targetCommitHash != "0") {
         std::string commitPath = objectsDir + "/" + targetCommitHash;
@@ -810,12 +801,12 @@ void SomeObj::Impl::checkoutBranch(const std::string& branchName) {
         }
     }
     
-    //  恢复目标提交的所有文件
+    // 恢复目标提交的所有文件
     for (const auto& filename : targetFiles) {
         restoreFileFromCommit(targetCommitHash, filename);
     }
     
-    //  删除在当前分支中存在但在目标分支中不存在的文件
+    // 删除在当前分支中存在但在目标分支中不存在的文件
     for (const auto& filename : currentFiles) {
         if (targetFiles.find(filename) == targetFiles.end()) {
             if (Utils::exists(filename)) {
@@ -824,11 +815,12 @@ void SomeObj::Impl::checkoutBranch(const std::string& branchName) {
         }
     }
     
-    //  更新当前分支
+    // 更新当前分支
+    // 注意：对于远程分支格式（如 R1/master），我们也将其设置为当前分支
     currentBranch = branchName;
     saveHead();
     
-    //  清空暂存区
+    // 清空暂存区
     stagedFiles.clear();
     removedFiles.clear();
     saveStaging();
