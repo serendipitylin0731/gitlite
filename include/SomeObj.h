@@ -9,22 +9,17 @@ class SomeObj {
 public:
     SomeObj();
     ~SomeObj();
-    
-    // Subtask1
+
     void init();
     void add(const std::string& filename);
     void commit(const std::string& message);
     void rm(const std::string& filename);
-    
-    // Subtask2
     void status();
     void log();
     void globalLog();
     void find(const std::string& commitMessage);
     void checkoutFile(const std::string& filename);
     void checkoutFileInCommit(const std::string& commitId, const std::string& filename);
-    
-    // 其他命令（暂不实现）
     void checkoutBranch(const std::string& branchName);
     void branch(const std::string& branchName);
     void rmBranch(const std::string& branchName);
